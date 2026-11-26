@@ -1,0 +1,10 @@
+**/.git
+**/.vs
+**/.vscode
+**/bin
+**/obj
+data/
+src/Drvrs.Web/data/
+*.db
+*.db-shm
+*.db-wal

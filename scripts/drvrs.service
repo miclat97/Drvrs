@@ -1,0 +1,19 @@
+[Unit]
+Description=Drvrs — Egzamin Teoretyczny na Prawo Jazdy (.NET 11)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/drvrs
+ExecStart=/usr/bin/dotnet /opt/drvrs/Drvrs.Web.dll
+Restart=always
+RestartSec=5
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://127.0.0.1:5080
+Environment=Drvrs__DataDirectory=/var/lib/drvrs
+Environment=Drvrs__ReplaceWmvAfterTranscode=true
+
+[Install]
+WantedBy=multi-user.target
