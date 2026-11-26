@@ -459,6 +459,10 @@
     } else {
       updatePhaseHeaderUI();
     }
+
+    if (state.currentView === 'exam') {
+      startExamLoop();
+    }
   }
 
   function syncQuestionPhaseFromDto(q, nowPerf) {
@@ -511,6 +515,16 @@
 
   function renderExamMediaViewport(q) {
     const viewport = $('exam-media-viewport');
+    const prevVideo = viewport.querySelector('video');
+    if (prevVideo) {
+      try {
+        prevVideo.pause();
+        prevVideo.removeAttribute('src');
+        prevVideo.load();
+      } catch {
+        // ignore
+      }
+    }
     viewport.innerHTML = '';
 
     if (q.mediaKind === 'VIDEO' && q.mediaAvailable && q.mediaUrl) {
@@ -518,7 +532,7 @@
       const video = document.createElement('video');
       video.id = 'exam-video-player';
       video.src = q.mediaUrl;
-      video.preload = 'auto';
+      video.preload = 'metadata';
       video.playsInline = true;
       video.controls = false;
       video.disablePictureInPicture = true;
@@ -794,6 +808,7 @@
       }
     } catch (err) {
       console.error('Błąd zapisu odpowiedzi:', err);
+    } finally {
       state.isSubmitting = false;
     }
   }
@@ -1274,17 +1289,22 @@
   // =========================================================================
   // Event Listeners Initialization
   // =========================================================================
+  function on(id, eventName, handler) {
+    const el = $(id);
+    if (el) el.addEventListener(eventName, handler);
+  }
+
   function init() {
-    $('nav-brand-home').addEventListener('click', () => switchView('home'));
+    on('nav-brand-home', 'click', () => switchView('home'));
     document.querySelectorAll('.nav-btn').forEach((btn) => {
       btn.addEventListener('click', () => switchView(btn.dataset.view));
     });
 
-    $('btn-start-exam').addEventListener('click', startOfficialExam);
-    $('btn-goto-study').addEventListener('click', () => switchView('study'));
+    on('btn-start-exam', 'click', startOfficialExam);
+    on('btn-goto-study', 'click', () => switchView('study'));
 
-    $('btn-next-question').addEventListener('click', handleNextQuestionClick);
-    $('btn-finish-exam-early').addEventListener('click', async () => {
+    on('btn-next-question', 'click', handleNextQuestionClick);
+    on('btn-finish-exam-early', 'click', async () => {
       if (!state.exam) return;
       const confirmEnd = window.confirm(
         'Czy na pewno chcesz zakończyć egzamin przed czasem? Wszystkie pozostałe pytania zostaną ocenione na 0 punktów.'
@@ -1297,8 +1317,8 @@
       }
     });
 
-    $('btn-restart-exam').addEventListener('click', startOfficialExam);
-    $('btn-back-home').addEventListener('click', () => switchView('home'));
+    on('btn-restart-exam', 'click', startOfficialExam);
+    on('btn-back-home', 'click', () => switchView('home'));
 
     document.querySelectorAll('.filter-tab').forEach((tab) => {
       tab.addEventListener('click', () => {
@@ -1310,12 +1330,12 @@
 
     // Study search events
     let searchDebounce = null;
-    $('study-search-form').addEventListener('submit', (e) => {
+    on('study-search-form', 'submit', (e) => {
       e.preventDefault();
       state.studyPage = 1;
       loadStudyQuestions();
     });
-    $('study-search-input').addEventListener('input', () => {
+    on('study-search-input', 'input', () => {
       window.clearTimeout(searchDebounce);
       searchDebounce = window.setTimeout(() => {
         state.studyPage = 1;
@@ -1323,24 +1343,24 @@
       }, 280);
     });
     ['study-category-select', 'study-scope-select', 'study-points-select'].forEach((id) => {
-      $(id).addEventListener('change', () => {
+      on(id, 'change', () => {
         state.studyPage = 1;
         loadStudyQuestions();
       });
     });
-    $('btn-study-prev').addEventListener('click', () => {
+    on('btn-study-prev', 'click', () => {
       if (state.studyPage > 1) {
         state.studyPage--;
         loadStudyQuestions();
       }
     });
-    $('btn-study-next').addEventListener('click', () => {
+    on('btn-study-next', 'click', () => {
       state.studyPage++;
       loadStudyQuestions();
     });
 
     // History clear
-    $('btn-clear-history').addEventListener('click', () => {
+    on('btn-clear-history', 'click', () => {
       if (window.confirm('Czy na pewno chcesz wyczyścić lokalną historię wyników?')) {
         window.localStorage.removeItem(HISTORY_STORAGE_KEY);
         renderHistoryView();
@@ -1348,11 +1368,11 @@
     });
 
     // Admin login, logout, and data sync buttons (/admin)
-    $('admin-login-form').addEventListener('submit', handleAdminLogin);
-    $('btn-admin-logout').addEventListener('click', handleAdminLogout);
-    $('btn-sync-questions').addEventListener('click', () => triggerGovSync(false));
-    $('btn-sync-all-media').addEventListener('click', () => triggerGovSync(true));
-    $('btn-rescan-local').addEventListener('click', triggerLocalRescan);
+    on('admin-login-form', 'submit', handleAdminLogin);
+    on('btn-admin-logout', 'click', handleAdminLogout);
+    on('btn-sync-questions', 'click', () => triggerGovSync(false));
+    on('btn-sync-all-media', 'click', () => triggerGovSync(true));
+    on('btn-rescan-local', 'click', triggerLocalRescan);
 
     window.addEventListener('keydown', handleExamKeydown);
     window.addEventListener('popstate', () => {

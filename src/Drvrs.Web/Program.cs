@@ -120,7 +120,19 @@ app.Use(async (context, next) =>
 });
 
 app.UseDefaultFiles();
-app.UseStaticFiles();
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx =>
+    {
+        var name = ctx.File.Name;
+        if (name.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".js", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".css", StringComparison.OrdinalIgnoreCase))
+        {
+            ctx.Context.Response.Headers.CacheControl = "no-cache";
+        }
+    }
+});
 app.UseRateLimiter();
 
 var api = app.MapGroup("/api").RequireRateLimiting("GeneralApi");
