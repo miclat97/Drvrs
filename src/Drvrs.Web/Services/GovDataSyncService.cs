@@ -1,4 +1,7 @@
 using System.IO.Compression;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using Drvrs.Web.Configuration;
@@ -9,8 +12,9 @@ using Microsoft.Extensions.Options;
 namespace Drvrs.Web.Services;
 
 /// <summary>
-/// Handles local file auto-import as well as automated downloading from gov.pl.
-/// Archives are processed sequentially one-by-one and permanently deleted immediately after unpacking to minimize peak disk space.
+/// Handles local file auto-import as well as resumable automated downloading from gov.pl.
+/// Archives are processed sequentially one-by-one and permanently deleted immediately after full unpacking to reclaim disk space,
+/// while surviving container restarts cleanly via HTTP Range resume and per-archive completion tracking.
 /// </summary>
 public sealed partial class GovDataSyncService
 {
@@ -19,6 +23,7 @@ public sealed partial class GovDataSyncService
     private readonly QuestionRepository _repository;
     private readonly MediaService _mediaService;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IHostApplicationLifetime _appLifetime;
     private readonly DrvrsOptions _options;
     private readonly ILogger<GovDataSyncService> _logger;
     private readonly SemaphoreSlim _syncLock = new(1, 1);
@@ -46,6 +51,7 @@ public sealed partial class GovDataSyncService
         QuestionRepository repository,
         MediaService mediaService,
         IHttpClientFactory httpClientFactory,
+        IHostApplicationLifetime appLifetime,
         IOptions<DrvrsOptions> options,
         ILogger<GovDataSyncService> logger)
     {
@@ -54,6 +60,7 @@ public sealed partial class GovDataSyncService
         _repository = repository;
         _mediaService = mediaService;
         _httpClientFactory = httpClientFactory;
+        _appLifetime = appLifetime;
         _options = options.Value;
         _logger = logger;
     }
@@ -104,7 +111,7 @@ public sealed partial class GovDataSyncService
 
     /// <summary>
     /// Scans data/ and data/questions/ for any manually placed .xlsx file and imports it if SQLite hasn't imported it yet.
-    /// Also triggers optional startup gov.pl sync when configured via environment variables (e.g. Docker).
+    /// Also checks actual media coverage so interrupted Docker downloads/extractions automatically resume on restart!
     /// </summary>
     public async Task InitializeLocalAndStartupDataAsync(CancellationToken ct = default)
     {
@@ -124,14 +131,27 @@ public sealed partial class GovDataSyncService
         _mediaService.RebuildIndex();
 
         var totalQuestions = await _repository.GetTotalCountAsync(ct);
+        var distinctMedia = totalQuestions > 0
+            ? await _repository.GetAllDistinctMediaFileNamesAsync(ct)
+            : [];
+        var availableMedia = distinctMedia.Count(m => _mediaService.HasMedia(m));
+
+        _logger.LogInformation(
+            "Stan bazy przy starcie: {Questions} pytań w SQLite, {AvailableMedia} / {TotalMedia} załączników multimedialnych dostępnych w {MediaDir}.",
+            totalQuestions, availableMedia, distinctMedia.Count, _db.MediaDirectory);
+
         var needQuestions = _options.AutoSyncQuestionsOnStartup && totalQuestions == 0;
-        var needMedia = _options.AutoSyncMediaOnStartup && _mediaService.AvailableLogicalMediaCount == 0;
+        // Resume media sync if fewer than 99% of referenced media files are on disk (handles interrupted restarts!)
+        var isMediaIncomplete = distinctMedia.Count == 0
+            ? _mediaService.AvailableLogicalMediaCount == 0
+            : availableMedia < (int)(distinctMedia.Count * 0.99);
+        var needMedia = _options.AutoSyncMediaOnStartup && isMediaIncomplete;
 
         if (needQuestions || needMedia)
         {
             _logger.LogInformation(
-                "Automatyczna synchronizacja przy starcie (Pytania={NeedQuestions}, Multimedia={NeedMedia})...",
-                needQuestions, needMedia);
+                "Uruchamiam automatyczną synchronizację w tle (PobierzPytania={NeedQuestions}, PobierzMultimedia={NeedMedia}, BrakujePlików={Missing})...",
+                needQuestions, needMedia, Math.Max(0, distinctMedia.Count - availableMedia));
 
             _ = TryStartBackgroundSync(new StartSyncRequest(
                 DownloadQuestions: needQuestions || totalQuestions == 0,
@@ -177,7 +197,18 @@ public sealed partial class GovDataSyncService
         {
             try
             {
-                await RunSyncCoreAsync(request, startedAt, CancellationToken.None);
+                await RunSyncCoreAsync(request, startedAt, _appLifetime.ApplicationStopping);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("Synchronizacja z gov.pl została wstrzymana (zatrzymanie kontenera/aplikacji) — zostanie wznowiona przy kolejnym starcie.");
+                _currentStatus = _currentStatus with
+                {
+                    IsRunning = false,
+                    Stage = "INTERRUPTED",
+                    Message = "Wstrzymano synchronizację (zostanie wznowiona po restarcie).",
+                    FinishedAtUtc = DateTimeOffset.UtcNow
+                };
             }
             catch (Exception ex)
             {
@@ -227,9 +258,7 @@ public sealed partial class GovDataSyncService
 
             try
             {
-                await DownloadFileWithProgressAsync(client, excelUrl, tempXlsx, startedAt, "DOWNLOADING_EXCEL", "Pobieranie bazy pytań (.xlsx)...", ct);
-
-                // Check if downloaded file is a .zip wrapper or direct .xlsx (note: .xlsx itself is a zip containing [Content_Types].xml)
+                await DownloadFileResumableAsync(client, excelUrl, tempXlsx, startedAt, "DOWNLOADING_EXCEL", "Baza pytań (.xlsx)", allowResume: false, ct);
                 EnsureValidXlsxOrUnwrap(tempXlsx, targetXlsx);
             }
             finally
@@ -248,34 +277,69 @@ public sealed partial class GovDataSyncService
             var ibm852 = Encoding.GetEncoding(852);
             var convertWmv = request.ConvertWmvToMp4 && _mediaService.IsFfmpegAvailable;
 
+            // If media directory was wiped empty by user, reset per-archive completion markers
+            if (_mediaService.AvailableLogicalMediaCount == 0)
+            {
+                foreach (var u in archiveUrls)
+                {
+                    await _db.SetMetadataAsync(GetArchiveDoneKey(u), "false", ct);
+                }
+            }
+
             for (var i = 0; i < archiveUrls.Count; i++)
             {
+                ct.ThrowIfCancellationRequested();
+
                 var url = archiveUrls[i];
+                var archiveDoneKey = GetArchiveDoneKey(url);
                 var archiveLabel = $"Archiwum multimediów {i + 1}/{archiveUrls.Count}";
-                var tempZipPath = Path.Combine(_db.TempDirectory, $"media_part_{i + 1}_{Guid.NewGuid():N}.zip");
+
+                // Skip archive if it was already 100% unpacked in an earlier run and media folder wasn't cleared
+                var alreadyDone = await _db.GetMetadataAsync(archiveDoneKey, ct);
+                if (string.Equals(alreadyDone, "true", StringComparison.OrdinalIgnoreCase) &&
+                    _mediaService.AvailableLogicalMediaCount > 2500)
+                {
+                    _logger.LogInformation("{Label}: archiwum zostało już wcześniej w pełni rozpakowane — pomijam.", archiveLabel);
+                    continue;
+                }
+
+                var urlHash = ComputeShortHash(url);
+                var tempZipPath = Path.Combine(_db.TempDirectory, $"media_archive_{i + 1}_{urlHash}.zip");
 
                 try
                 {
-                    await DownloadFileWithProgressAsync(
+                    await DownloadFileResumableAsync(
                         client,
                         url,
                         tempZipPath,
                         startedAt,
                         "DOWNLOADING_MEDIA",
-                        $"{archiveLabel}: pobieranie z gov.pl...",
+                        archiveLabel,
+                        allowResume: true,
                         ct);
 
                     await ExtractAndCleanZipAsync(tempZipPath, archiveLabel, ibm852, convertWmv, startedAt, ct);
-                }
-                finally
-                {
-                    // CRITICAL: Immediately delete the multi-gigabyte .zip file right after unpacking to reclaim disk space!
+
+                    // Mark archive completed and IMMEDIATELY delete the multi-GB .zip file to reclaim disk space!
+                    await _db.SetMetadataAsync(archiveDoneKey, "true", ct);
                     SafeDeleteFile(tempZipPath);
-                    _logger.LogInformation("{Label}: trwale usunięto tymczasowe archiwum źródłowe .zip w celu zwolnienia miejsca na dysku.", archiveLabel);
+                    _logger.LogInformation("{Label}: rozpakowano w 100% i trwale usunięto plik źródłowy .zip z dysku.", archiveLabel);
+                }
+                catch (InvalidDataException ex)
+                {
+                    // Corrupted zip on disk -> delete it so next attempt downloads cleanly
+                    _logger.LogError(ex, "{Label}: wykryto uszkodzone archiwum .zip — usuwam plik tymczasowy.", archiveLabel);
+                    SafeDeleteFile(tempZipPath);
+                    throw;
                 }
             }
 
             _mediaService.RebuildIndex();
+            var distinctMedia = await _repository.GetAllDistinctMediaFileNamesAsync(ct);
+            var availableAfter = distinctMedia.Count(m => _mediaService.HasMedia(m));
+            _logger.LogInformation(
+                "Synchronizacja multimediów zakończona! Dostępne pliki: {Available} / {Total}.",
+                availableAfter, distinctMedia.Count);
         }
 
         _currentStatus = new SyncJobStatusDto(
@@ -301,6 +365,7 @@ public sealed partial class GovDataSyncService
     {
         int totalEntries;
         int extracted = 0;
+        int newlyWritten = 0;
 
         using (var fs = File.OpenRead(zipPath))
         using (var archive = new ZipArchive(fs, ZipArchiveMode.Read, leaveOpen: false, entryNameEncoding: fallbackEncoding))
@@ -310,13 +375,13 @@ public sealed partial class GovDataSyncService
                 .ToList();
 
             totalEntries = fileEntries.Count;
+            _logger.LogInformation("{Label}: rozpoczynam rozpakowywanie {Total} plików do {MediaDir}...", archiveLabel, totalEntries, _db.MediaDirectory);
             UpdateStatus(startedAt, "EXTRACTING_MEDIA", $"{archiveLabel}: rozpakowywanie {totalEntries} plików...", 0, null, 0, totalEntries);
 
             foreach (var entry in fileEntries)
             {
                 ct.ThrowIfCancellationRequested();
 
-                // Flatten any subfolder (e.g. "multimedia do pytań/..." or "cz. 2/...") directly into data/media/
                 var flatFileName = Path.GetFileName(entry.FullName.Replace('\\', '/')).Normalize(NormalizationForm.FormC);
                 if (string.IsNullOrWhiteSpace(flatFileName))
                 {
@@ -328,7 +393,6 @@ public sealed partial class GovDataSyncService
                 var destPath = Path.Combine(_db.MediaDirectory, flatFileName);
                 var destMp4Path = Path.Combine(_db.MediaDirectory, $"{stem}.mp4");
 
-                // Skip if already converted to .mp4 or already extracted with matching byte size
                 if (ext == ".wmv" && File.Exists(destMp4Path))
                 {
                     extracted++;
@@ -357,6 +421,8 @@ public sealed partial class GovDataSyncService
                 }
 
                 extracted++;
+                newlyWritten++;
+
                 if (extracted % 25 == 0 || extracted == totalEntries)
                 {
                     UpdateStatus(
@@ -368,31 +434,101 @@ public sealed partial class GovDataSyncService
                         extracted,
                         totalEntries);
                 }
+
+                if (extracted % 500 == 0 || extracted == totalEntries)
+                {
+                    _logger.LogInformation("{Label}: postęp rozpakowywania {Extracted} / {Total} plików (nowo zapisane: {New})...", archiveLabel, extracted, totalEntries, newlyWritten);
+                }
             }
         }
     }
 
-    private async Task DownloadFileWithProgressAsync(
+    private async Task DownloadFileResumableAsync(
         HttpClient client,
         string url,
         string destinationPath,
         DateTimeOffset startedAt,
         string stage,
-        string messagePrefix,
+        string label,
+        bool allowResume,
         CancellationToken ct)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
 
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+        long? remoteTotalBytes = null;
+        var supportsRange = false;
+
+        try
+        {
+            using var headReq = new HttpRequestMessage(HttpMethod.Head, url);
+            using var headResp = await client.SendAsync(headReq, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (headResp.IsSuccessStatusCode)
+            {
+                remoteTotalBytes = headResp.Content.Headers.ContentLength;
+                supportsRange = headResp.Headers.AcceptRanges.Contains("bytes");
+            }
+        }
+        catch
+        {
+            // Continue with GET if HEAD fails
+        }
+
+        long existingBytes = 0;
+        if (allowResume && File.Exists(destinationPath))
+        {
+            existingBytes = new FileInfo(destinationPath).Length;
+            if (remoteTotalBytes.HasValue && existingBytes == remoteTotalBytes.Value && existingBytes > 0)
+            {
+                _logger.LogInformation("{Label}: pełny plik ({SizeMB:F1} MB) znajduje się już na dysku — przechodzę od razu do rozpakowywania.", label, existingBytes / (1024.0 * 1024.0));
+                UpdateStatus(startedAt, stage, $"{label}: pobrano 100%", existingBytes, remoteTotalBytes, 0, null);
+                return;
+            }
+
+            if (remoteTotalBytes.HasValue && existingBytes > remoteTotalBytes.Value)
+            {
+                SafeDeleteFile(destinationPath);
+                existingBytes = 0;
+            }
+        }
+
+        using var getReq = new HttpRequestMessage(HttpMethod.Get, url);
+        var canResume = allowResume && supportsRange && existingBytes > 0;
+        if (canResume)
+        {
+            getReq.Headers.Range = new RangeHeaderValue(existingBytes, null);
+            _logger.LogInformation("{Label}: wznawiam przerwane pobieranie od {DoneMB:F1} MB...", label, existingBytes / (1024.0 * 1024.0));
+        }
+        else
+        {
+            existingBytes = 0;
+            _logger.LogInformation("{Label}: rozpoczynam pobieranie z {Url}...", label, url);
+        }
+
+        using var response = await client.SendAsync(getReq, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
 
-        var totalBytes = response.Content.Headers.ContentLength;
+        var isPartial = response.StatusCode == HttpStatusCode.PartialContent;
+        if (!isPartial)
+        {
+            existingBytes = 0;
+        }
+
+        var contentLen = response.Content.Headers.ContentLength;
+        var totalBytes = contentLen.HasValue ? existingBytes + contentLen.Value : remoteTotalBytes;
+
         await using var netStream = await response.Content.ReadAsStreamAsync(ct);
-        await using var fileStream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, 131072, useAsync: true);
+        await using var fileStream = new FileStream(
+            destinationPath,
+            isPartial ? FileMode.Append : FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            131072,
+            useAsync: true);
 
         var buffer = new byte[131072];
-        long downloaded = 0;
-        var lastReport = StopwatchTimestamp();
+        long downloaded = existingBytes;
+        var lastUiReport = DateTime.UtcNow.Ticks;
+        var lastLoggedDecile = totalBytes is > 0 ? (int)((downloaded * 10) / totalBytes.Value) : -1;
 
         while (true)
         {
@@ -405,15 +541,27 @@ public sealed partial class GovDataSyncService
             await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
             downloaded += read;
 
-            var nowTicks = StopwatchTimestamp();
-            if (nowTicks - lastReport > TimeSpan.TicksPerMillisecond * 250)
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (nowTicks - lastUiReport > TimeSpan.TicksPerMillisecond * 250)
             {
-                lastReport = nowTicks;
-                UpdateStatus(startedAt, stage, messagePrefix, downloaded, totalBytes, _currentStatus.ExtractedFiles, _currentStatus.TotalArchiveEntries);
+                lastUiReport = nowTicks;
+                UpdateStatus(startedAt, stage, $"{label}: pobieranie z gov.pl...", downloaded, totalBytes, 0, null);
+            }
+
+            if (totalBytes is > 0)
+            {
+                var decile = (int)((downloaded * 10) / totalBytes.Value);
+                if (decile > lastLoggedDecile)
+                {
+                    lastLoggedDecile = decile;
+                    _logger.LogInformation(
+                        "{Label}: pobrano {Pct}% ({DoneMB:F0} MB / {TotalMB:F0} MB)...",
+                        label, decile * 10, downloaded / (1024.0 * 1024.0), totalBytes.Value / (1024.0 * 1024.0));
+                }
             }
         }
 
-        UpdateStatus(startedAt, stage, messagePrefix, downloaded, totalBytes, _currentStatus.ExtractedFiles, _currentStatus.TotalArchiveEntries);
+        UpdateStatus(startedAt, stage, $"{label}: pobieranie zakończone.", downloaded, totalBytes, 0, null);
     }
 
     private static void EnsureValidXlsxOrUnwrap(string downloadedPath, string targetXlsxPath)
@@ -423,7 +571,6 @@ public sealed partial class GovDataSyncService
         using (var fs = File.OpenRead(downloadedPath))
         using (var zip = new ZipArchive(fs, ZipArchiveMode.Read))
         {
-            // Direct .xlsx contains xl/workbook.xml or xl/worksheets/sheet1.xml
             var isDirectXlsx = zip.Entries.Any(e => e.FullName.StartsWith("xl/worksheets/", StringComparison.OrdinalIgnoreCase));
             if (isDirectXlsx)
             {
@@ -432,7 +579,6 @@ public sealed partial class GovDataSyncService
                 return;
             }
 
-            // If wrapped inside an outer .zip containing an .xlsx file, extract the .xlsx directly
             var nestedXlsx = zip.Entries.FirstOrDefault(e => e.Name.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
                 ?? throw new InvalidDataException("Pobrany plik z gov.pl nie jest arkuszem .xlsx ani archiwum zawierającym plik .xlsx.");
 
@@ -533,7 +679,13 @@ public sealed partial class GovDataSyncService
             LastError: null);
     }
 
-    private static long StopwatchTimestamp() => DateTime.UtcNow.Ticks;
+    private static string GetArchiveDoneKey(string url) => $"MediaArchiveDone_{ComputeShortHash(url)}";
+
+    private static string ComputeShortHash(string input)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexStringLower(bytes)[..12];
+    }
 
     private static void SafeDeleteFile(string path)
     {

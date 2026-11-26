@@ -16,21 +16,13 @@ public sealed class DatabaseInitializer
         Directory.CreateDirectory(QuestionsDirectory);
         Directory.CreateDirectory(MediaDirectory);
         Directory.CreateDirectory(MediaCacheDirectory);
+        Directory.CreateDirectory(TempDirectory);
 
-        // Clean up any leftover temporary download files from an interrupted previous run
-        var tmpDir = TempDirectory;
-        if (Directory.Exists(tmpDir))
+        // Clean up only non-resumable *.tmp scratch files; keep resumable media_archive_*.zip files across restarts
+        foreach (var tmpFile in Directory.EnumerateFiles(TempDirectory, "*.tmp"))
         {
-            try
-            {
-                Directory.Delete(tmpDir, recursive: true);
-            }
-            catch
-            {
-                // Best-effort cleanup
-            }
+            try { File.Delete(tmpFile); } catch { /* best-effort */ }
         }
-        Directory.CreateDirectory(tmpDir);
 
         DatabasePath = Path.Combine(_dataDir, "drvrs.db");
         _connectionString = new SqliteConnectionStringBuilder
@@ -39,6 +31,28 @@ public sealed class DatabaseInitializer
             Mode = SqliteOpenMode.ReadWriteCreate,
             Pooling = true
         }.ToString();
+    }
+
+    public async Task<string?> GetMetadataAsync(string key, CancellationToken ct = default)
+    {
+        await using var conn = CreateConnection();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Value FROM Metadata WHERE Key = $k LIMIT 1;";
+        cmd.Parameters.AddWithValue("$k", key);
+        return await cmd.ExecuteScalarAsync(ct) as string;
+    }
+
+    public async Task SetMetadataAsync(string key, string value, CancellationToken ct = default)
+    {
+        await using var conn = CreateConnection();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO Metadata (Key, Value) VALUES ($k, $v)
+            ON CONFLICT(Key) DO UPDATE SET Value = excluded.Value;
+            """;
+        cmd.Parameters.AddWithValue("$k", key);
+        cmd.Parameters.AddWithValue("$v", value);
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public string DataDirectory => _dataDir;

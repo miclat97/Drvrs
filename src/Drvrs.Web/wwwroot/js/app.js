@@ -610,7 +610,7 @@
         <div class="no-media-placeholder">
           <div class="road-plate" aria-hidden="true">!</div>
           <div class="no-media-caption">Brak pliku multimedialnego na serwerze: <span class="mono-num">${escapeHtml(q.missingMediaFileName)}</span></div>
-          <div style="font-size:0.78rem; opacity:0.8;">Wgraj archiwum multimediów z gov.pl w zakładce „Baza i multimedia”.</div>
+          <div style="font-size:0.78rem; opacity:0.8;">Trwa pobieranie lub rozpakowywanie bazy multimediów w tle na serwerze.</div>
         </div>
       `;
       return;
