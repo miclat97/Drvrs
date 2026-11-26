@@ -93,8 +93,8 @@ Co dzieje się automatycznie po uruchomieniu kontenera:
    - oficjalny plik Excel z pytaniami (`https://www.gov.pl/attachment/a5c6c329-28a5-4274-a1a8-e2813f0a51bd`) i importuje go do SQLite,
    - pierwsze archiwum multimediów (`multimedia_do_pytan.zip`), rozpakowuje wszystkie pliki do `/app/data/media/` i **natychmiast trwale usuwa plik `.zip`**, zanim przejdzie dalej,
    - drugie archiwum multimediów (`cz. 2`), rozpakowuje pliki do `/app/data/media/` i **natychmiast trwale usuwa plik `.zip`**.
-3. Postęp pobierania i rozpakowywania możesz śledzić na żywo w przeglądarce (zakładka **„Baza i multimedia”**) lub w logach kontenera (`docker logs -f drvrs-prawo-jazdy`).
-4. Przy kolejnych restartach kontenera dane są już na trwałym wolumenie `drvrs-data`, więc aplikacja wstaje w ułamku sekundy bez ponownego pobierania.
+3. Postęp pobierania i rozpakowywania możesz śledzić w logach kontenera (`docker logs -f drvrs-prawo-jazdy`) lub po zalogowaniu na `/admin` (jeśli ustawiono `Drvrs__AdminToken`).
+4. Przy kolejnych restartach kontenera dane są już na trwałym wolumenie, więc aplikacja wstaje w ułamku sekundy bez ponownego pobierania.
 
 ### Najważniejsze zmienne środowiskowe (`docker-compose.yml` / `appsettings.json`)
 | Zmienna | Domyślnie (Docker) | Opis |
@@ -104,7 +104,20 @@ Co dzieje się automatycznie po uruchomieniu kontenera:
 | `Drvrs__AutoSyncMediaOnStartup` | `true` | Automatyczne pobranie i rozpakowanie multimediów przy pustym katalogu `media/` |
 | `Drvrs__ConvertWmvDuringSync` | `false` | Gdy `true`, od razu podczas wypakowywania konwertuje `.wmv` → `.mp4` i usuwa `.wmv` |
 | `Drvrs__ReplaceWmvAfterTranscode` | `true` | Gdy `true`, po transkodowaniu klipu `.wmv` w locie usuwa źródłowy `.wmv`, oszczędzając ~70% miejsca |
-| `Drvrs__AdminToken` | `""` | Opcjonalny token (`X-Admin-Token`) zabezpieczający wywołanie synchronizacji na publicznym serwerze |
+| `Drvrs__AdminToken` | `""` | **Gdy puste (`""`), panel `/admin` i endpointy `/api/admin/*` są całkowicie wyłączone (`403`)**. Ustaw długie hasło, aby odblokować logowanie pod `/admin` |
+| `Drvrs__MaxActiveExamSessions` | `2000` | Limit równoległych sesji egzaminacyjnych w RAM (ochrona przed wyczerpaniem pamięci) |
+| `Drvrs__ExamStartsPerMinutePerIp` | `15` | Limit nowych egzaminów na minutę na pojedynczy adres IP użytkownika |
+
+---
+
+## Bezpieczeństwo przy wystawieniu przez Cloudflare Tunnel (`cloudflared`)
+
+Aplikacja jest fabrycznie przygotowana do bezpiecznego działania w publicznym internecie za `cloudflared`:
+- **Brak panelu admina dla zwykłych użytkowników**: w nawigacji publicznej nie ma żadnych przycisków administracyjnych, a publiczne `/api/status` nie ujawnia ścieżek dyskowych serwera.
+- **Safe-by-default (`Drvrs__AdminToken=""`)**: dopóki nie ustawisz hasła w `Drvrs__AdminToken`, wszystkie endpointy `/api/admin/*` są całkowicie zablokowane (`403 Forbidden`), a bazę możesz synchronizować wyłącznie przez SSH (`--sync-all`).
+- **Bezpieczne logowanie pod `/admin`**: po ustawieniu `Drvrs__AdminToken` wejście pod `https://twoja-domena.pl/admin` wymaga hasła weryfikowanego w stałym czasie (`CryptographicOperations.FixedTimeEquals`), wystawia podpisane ciasteczko `HttpOnly; SameSite=Strict` ważne 8 godzin i blokuje próby *brute-force* po **5 błędnych próbach na minutę** z uwzględnieniem nagłówka `CF-Connecting-IP`.
+- **Nasłuch tylko na `127.0.0.1`**: zarówno `docker-compose.yml` (`127.0.0.1:8080:8080`), jak i `scripts/drvrs.service` (`http://127.0.0.1:5080`) wystawiają port wyłącznie lokalnie dla `cloudflared` (Docker nie ominie `ufw`/`iptables` na porcie zewnętrznym).
+- **Dodatkowa warstwa Zero Trust (opcjonalnie)**: w panelu Cloudflare Zero Trust (*Access → Applications*) możesz dodatkowo objąć ścieżki `/admin*` oraz `/api/admin*` polityką logowania Email OTP / GitHub przed wpuszczeniem ruchu do tunelu.
 
 ---
 

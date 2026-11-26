@@ -6,17 +6,18 @@ services:
     container_name: drvrs-prawo-jazdy
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       # Automatyczne pobranie pytań (.xlsx -> SQLite) przy pierwszym starcie, gdy wolumen jest pusty:
       Drvrs__AutoSyncQuestionsOnStartup: "true"
       # Automatyczne pobranie multimediów (.zip) ze strony gov.pl, rozpakowanie i NATYCHMIASTOWE usunięcie plików .zip:
       Drvrs__AutoSyncMediaOnStartup: "true"
-      # Opcjonalnie ustaw "true", aby od razu podczas rozpakowywania skonwertować wszystkie .wmv -> .mp4 (zmniejsza dysk z ~9.5 GB do ~2.5 GB, ale trwa dłużej przy pierwszym uruchomieniu):
+      # Opcjonalnie ustaw "true", aby od razu podczas rozpakowywania skonwertować wszystkie .wmv -> .mp4 (zmniejsza dysk z ~9.5 GB do ~2.5 GB):
       Drvrs__ConvertWmvDuringSync: "false"
       # Po obejrzeniu/transkodowaniu pojedynczego klipu .wmv w locie zastępuje go mniejszym plikiem .mp4 (oszczędza miejsce):
       Drvrs__ReplaceWmvAfterTranscode: "true"
-      # Na publicznym serwerze możesz ustawić własny sekretny token chroniący przycisk synchronizacji w panelu WWW:
+      # BEZPIECZEŃSTWO: Gdy puste (""), panel WWW /admin oraz endpointy /api/admin/* są CAŁKOWICIE WYŁĄCZONE (403 Forbidden).
+      # Aby odblokować ukryty panel pod adresem /admin, wpisz tutaj długie, losowe hasło:
       Drvrs__AdminToken: ""
     volumes:
       - drvrs-data:/app/data

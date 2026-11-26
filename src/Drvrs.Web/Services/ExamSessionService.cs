@@ -1,17 +1,21 @@
 using System.Collections.Concurrent;
+using Drvrs.Web.Configuration;
 using Drvrs.Web.Data;
 using Drvrs.Web.Models;
+using Microsoft.Extensions.Options;
 
 namespace Drvrs.Web.Services;
 
 public sealed class ExamSessionService(
     QuestionRepository repository,
     MediaService mediaService,
-    TimeProvider timeProvider)
+    TimeProvider timeProvider,
+    IOptions<DrvrsOptions> options)
 {
     private static readonly TimeSpan NetworkGraceWindow = TimeSpan.FromSeconds(2.5);
     private static readonly TimeSpan MaxVideoPlaybackSafetyCap = TimeSpan.FromSeconds(180);
-    private static readonly TimeSpan SessionRetention = TimeSpan.FromHours(6);
+    private static readonly TimeSpan ActiveSessionRetention = TimeSpan.FromMinutes(35);
+    private static readonly TimeSpan CompletedSessionRetention = TimeSpan.FromMinutes(15);
 
     private readonly ConcurrentDictionary<Guid, ExamSession> _sessions = new();
 
@@ -505,10 +509,34 @@ public sealed class ExamSessionService(
 
     private void PruneOldSessions()
     {
-        var cutoff = timeProvider.GetUtcNow() - SessionRetention;
+        var now = timeProvider.GetUtcNow();
+        var activeCutoff = now - ActiveSessionRetention;
+        var completedCutoff = now - CompletedSessionRetention;
+
         foreach (var (id, session) in _sessions)
         {
-            if (session.StartedAtUtc < cutoff)
+            var expired = session.CompletedAtUtc.HasValue
+                ? session.CompletedAtUtc.Value < completedCutoff
+                : session.StartedAtUtc < activeCutoff;
+
+            if (expired)
+            {
+                _sessions.TryRemove(id, out _);
+            }
+        }
+
+        var maxSessions = Math.Max(50, options.Value.MaxActiveExamSessions);
+        if (_sessions.Count >= maxSessions)
+        {
+            var overflow = _sessions.Count - maxSessions + 1;
+            var oldestIds = _sessions.Values
+                .OrderBy(s => s.CompletedAtUtc.HasValue ? 0 : 1)
+                .ThenBy(s => s.StartedAtUtc)
+                .Take(overflow)
+                .Select(s => s.Id)
+                .ToList();
+
+            foreach (var id in oldestIds)
             {
                 _sessions.TryRemove(id, out _);
             }

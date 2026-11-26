@@ -41,7 +41,7 @@ public sealed class ExcelImporterAndExamRulesTests : IDisposable
         _repo = new QuestionRepository(_db);
         _media = new MediaService(_db, opts, NullLogger<MediaService>.Instance);
         _clock = new ManualTimeProvider(new DateTimeOffset(2026, 11, 26, 12, 0, 0, TimeSpan.Zero));
-        _examService = new ExamSessionService(_repo, _media, _clock);
+        _examService = new ExamSessionService(_repo, _media, _clock, opts);
     }
 
     [Fact]

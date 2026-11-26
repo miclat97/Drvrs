@@ -60,7 +60,24 @@ public sealed partial class GovDataSyncService
 
     public SyncJobStatusDto CurrentStatus => _currentStatus;
 
-    public async Task<DatabaseStatusDto> GetDatabaseStatusAsync(CancellationToken ct = default)
+    public async Task<PublicStatusDto> GetPublicStatusAsync(CancellationToken ct = default)
+    {
+        var totalQuestions = await _repository.GetTotalCountAsync(ct);
+        var categories = await _repository.GetCategoryStatsAsync(ct);
+        var catB = categories.FirstOrDefault(c => c.Category == "B")?.TotalQuestions ?? 0;
+        var distinctMedia = await _repository.GetAllDistinctMediaFileNamesAsync(ct);
+        var availableReferenced = distinctMedia.Count(m => _mediaService.HasMedia(m));
+        var hasPartialMediaOnly = distinctMedia.Count > 0 && availableReferenced > 0 && availableReferenced < distinctMedia.Count * 0.95;
+
+        return new PublicStatusDto(
+            HasQuestions: totalQuestions > 0,
+            TotalQuestions: totalQuestions,
+            CategoryBQuestions: catB,
+            HasPartialMediaOnly: hasPartialMediaOnly,
+            Categories: categories);
+    }
+
+    public async Task<AdminStatusDto> GetAdminStatusAsync(CancellationToken ct = default)
     {
         var totalQuestions = await _repository.GetTotalCountAsync(ct);
         var categories = await _repository.GetCategoryStatsAsync(ct);
@@ -69,7 +86,7 @@ public sealed partial class GovDataSyncService
         var availableReferenced = distinctMedia.Count(m => _mediaService.HasMedia(m));
         var (sourceExcel, importedAt) = await _repository.GetImportMetadataAsync(ct);
 
-        return new DatabaseStatusDto(
+        return new AdminStatusDto(
             HasQuestions: totalQuestions > 0,
             TotalQuestions: totalQuestions,
             CategoryBQuestions: catB,
@@ -81,8 +98,6 @@ public sealed partial class GovDataSyncService
             LastImportedAtUtc: importedAt,
             DataDirectoryPath: _db.DataDirectory,
             MediaDirectoryPath: _db.MediaDirectory,
-            AdminSyncEnabled: _options.EnableAdminEndpoints,
-            AdminTokenRequired: !string.IsNullOrWhiteSpace(_options.AdminToken),
             Categories: categories,
             SyncJob: _currentStatus);
     }

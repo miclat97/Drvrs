@@ -7,7 +7,20 @@ public sealed record CategoryCountDto(
     int SpecialistQuestions,
     bool ReadyForOfficialExam);
 
-public sealed record DatabaseStatusDto(
+/// <summary>
+/// Safe public metadata exposed to anonymous exam takers — never leaks server paths or internal sync state.
+/// </summary>
+public sealed record PublicStatusDto(
+    bool HasQuestions,
+    int TotalQuestions,
+    int CategoryBQuestions,
+    bool HasPartialMediaOnly,
+    IReadOnlyList<CategoryCountDto> Categories);
+
+/// <summary>
+/// Full diagnostic status available exclusively to authenticated administrators via /api/admin/status.
+/// </summary>
+public sealed record AdminStatusDto(
     bool HasQuestions,
     int TotalQuestions,
     int CategoryBQuestions,
@@ -19,8 +32,6 @@ public sealed record DatabaseStatusDto(
     DateTimeOffset? LastImportedAtUtc,
     string DataDirectoryPath,
     string MediaDirectoryPath,
-    bool AdminSyncEnabled,
-    bool AdminTokenRequired,
     IReadOnlyList<CategoryCountDto> Categories,
     SyncJobStatusDto SyncJob);
 
@@ -40,3 +51,5 @@ public sealed record StartSyncRequest(
     bool DownloadQuestions = true,
     bool DownloadMedia = false,
     bool ConvertWmvToMp4 = false);
+
+public sealed record AdminLoginRequest(string Password);

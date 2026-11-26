@@ -79,7 +79,7 @@
   // =========================================================================
   // View Navigation
   // =========================================================================
-  function switchView(viewName) {
+  function switchView(viewName, updateUrl = true) {
     if (state.currentView === 'exam' && viewName !== 'exam' && viewName !== 'summary') {
       if (state.exam && !state.exam.isCompleted) {
         const leave = window.confirm('Trwa egzamin państwowy! Czy na pewno chcesz przerwać i zakończyć obecny egzamin?');
@@ -89,8 +89,17 @@
       }
     }
 
+    if (viewName !== 'admin') {
+      stopSyncPolling();
+      if (updateUrl && window.location.pathname.startsWith('/admin')) {
+        window.history.pushState({}, '', '/');
+      }
+    } else if (updateUrl && !window.location.pathname.startsWith('/admin')) {
+      window.history.pushState({}, '', '/admin');
+    }
+
     state.currentView = viewName;
-    const views = ['home', 'exam', 'summary', 'study', 'history', 'data'];
+    const views = ['home', 'exam', 'summary', 'study', 'history', 'admin'];
     views.forEach((v) => {
       const el = $(`view-${v}`);
       if (el) el.classList.toggle('hidden', v !== viewName);
@@ -104,13 +113,13 @@
     $('main-nav').classList.toggle('hidden', viewName === 'exam');
 
     if (viewName === 'home') {
-      refreshStatus();
+      refreshPublicStatus();
     } else if (viewName === 'study') {
       loadStudyQuestions();
     } else if (viewName === 'history') {
       renderHistoryView();
-    } else if (viewName === 'data') {
-      refreshStatus();
+    } else if (viewName === 'admin') {
+      loadAdminSessionAndPanel();
     }
 
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -130,15 +139,118 @@
   }
 
   // =========================================================================
-  // Database & Media Status + Gov.pl Sync
+  // Public Database Status + Protected Admin Panel (/admin)
   // =========================================================================
-  async function refreshStatus() {
+  async function refreshPublicStatus() {
     try {
       const resp = await fetch('/api/status');
       if (!resp.ok) return;
       const status = await resp.json();
       state.dbStatus = status;
-      renderStatusUI(status);
+      renderPublicStatusUI(status);
+    } catch (err) {
+      console.error('Nie udało się pobrać statusu bazy:', err);
+    }
+  }
+
+  function renderPublicStatusUI(status) {
+    const qSum = $('status-questions-summary');
+    const partialWrap = $('partial-media-option-wrap');
+
+    if (status.hasQuestions) {
+      qSum.innerHTML = `<span class="status-dot ok"></span>Oficjalny katalog pytań aktywny: <strong>${status.totalQuestions.toLocaleString('pl-PL')}</strong> pytań (kat. B: <strong>${status.categoryBQuestions.toLocaleString('pl-PL')}</strong>)`;
+    } else {
+      qSum.innerHTML = `<span class="status-dot warn"></span>Trwa przygotowywanie bazy pytań na serwerze...`;
+    }
+
+    partialWrap.classList.toggle('hidden', !status.hasPartialMediaOnly);
+
+    if (Array.isArray(status.categories) && status.categories.length > 0) {
+      populateCategorySelect($('exam-category-select'), status.categories, true);
+      populateCategorySelect($('study-category-select'), status.categories, false);
+    }
+  }
+
+  async function loadAdminSessionAndPanel() {
+    try {
+      const resp = await fetch('/api/admin/session', { credentials: 'same-origin' });
+      if (!resp.ok) return;
+      const session = await resp.json();
+
+      $('admin-disabled-card').classList.toggle('hidden', session.enabled);
+      $('admin-login-card').classList.toggle('hidden', !session.enabled || session.authenticated);
+      $('admin-dashboard-card').classList.toggle('hidden', !session.enabled || !session.authenticated);
+
+      if (session.enabled && session.authenticated) {
+        await refreshAdminStatus();
+      } else {
+        stopSyncPolling();
+      }
+    } catch (err) {
+      console.error('Błąd sprawdzania sesji administratora:', err);
+    }
+  }
+
+  async function handleAdminLogin(e) {
+    e.preventDefault();
+    const errEl = $('admin-login-error');
+    errEl.classList.add('hidden');
+    const pwdInput = $('admin-password-input');
+    const password = pwdInput.value;
+    $('btn-admin-login').disabled = true;
+
+    try {
+      const resp = await fetch('/api/admin/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+
+      if (resp.status === 429) {
+        errEl.textContent = 'Zbyt wiele prób logowania. Odczekaj minutę i spróbuj ponownie.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+
+      if (!resp.ok) {
+        errEl.textContent = 'Nieprawidłowe hasło administratora.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+
+      pwdInput.value = '';
+      await loadAdminSessionAndPanel();
+    } catch {
+      errEl.textContent = 'Błąd połączenia z serwerem.';
+      errEl.classList.remove('hidden');
+    } finally {
+      $('btn-admin-login').disabled = false;
+    }
+  }
+
+  async function handleAdminLogout() {
+    stopSyncPolling();
+    try {
+      await fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch {
+      // ignore
+    }
+    await loadAdminSessionAndPanel();
+  }
+
+  async function refreshAdminStatus() {
+    try {
+      const resp = await fetch('/api/admin/status', { credentials: 'same-origin' });
+      if (resp.status === 401 || resp.status === 403) {
+        stopSyncPolling();
+        await loadAdminSessionAndPanel();
+        return;
+      }
+      if (!resp.ok) return;
+
+      const status = await resp.json();
+      renderAdminStatusUI(status);
 
       if (status.syncJob && status.syncJob.isRunning) {
         ensureSyncPolling();
@@ -146,40 +258,14 @@
         stopSyncPolling();
       }
     } catch (err) {
-      console.error('Nie udało się pobrać statusu bazy:', err);
+      console.error('Błąd pobierania statusu administratora:', err);
     }
   }
 
-  function renderStatusUI(status) {
-    const qSum = $('status-questions-summary');
-    const mSum = $('status-media-summary');
-    const partialWrap = $('partial-media-option-wrap');
-
-    if (status.hasQuestions) {
-      qSum.innerHTML = `<span class="status-dot ok"></span>Baza SQLite gotowa: <strong>${status.totalQuestions.toLocaleString('pl-PL')}</strong> pytań (kat. B: <strong>${status.categoryBQuestions.toLocaleString('pl-PL')}</strong>)`;
-    } else {
-      qSum.innerHTML = `<span class="status-dot warn"></span>Brak zaimportowanych pytań w bazie SQLite — pobierz bazę w zakładce „Baza i multimedia”`;
-    }
-
+  function renderAdminStatusUI(status) {
     const totalRef = status.totalDistinctMediaReferenced || 0;
     const availRef = status.availableMediaFilesCount || 0;
-    if (totalRef > 0) {
-      mSum.textContent = `Multimedia: ${availRef.toLocaleString('pl-PL')} / ${totalRef.toLocaleString('pl-PL')}`;
-      // Show convenience filter option when partial media is loaded on disk
-      const isPartial = availRef > 0 && availRef < totalRef * 0.95;
-      partialWrap.classList.toggle('hidden', !isPartial);
-    } else {
-      mSum.textContent = '';
-      partialWrap.classList.add('hidden');
-    }
 
-    // Populate category dropdowns dynamically if DB has categories
-    if (Array.isArray(status.categories) && status.categories.length > 0) {
-      populateCategorySelect($('exam-category-select'), status.categories, true);
-      populateCategorySelect($('study-category-select'), status.categories, false);
-    }
-
-    // Data management view metrics
     $('data-stat-questions').textContent = status.totalQuestions.toLocaleString('pl-PL');
     $('data-stat-catb').textContent = status.categoryBQuestions.toLocaleString('pl-PL');
     $('data-stat-media').textContent = totalRef > 0
@@ -187,15 +273,11 @@
       : availRef.toLocaleString('pl-PL');
     $('data-stat-ffmpeg').textContent = status.ffmpegAvailable ? 'Aktywny (H.264)' : 'Brak w PATH';
 
-    $('admin-token-box').classList.toggle('hidden', !status.adminTokenRequired);
-    $('admin-sync-buttons').classList.toggle('hidden', !status.adminSyncEnabled);
-
     $('data-paths-code').textContent =
       `Katalog danych: ${status.dataDirectoryPath}\n` +
       `Arkusz pytań (.xlsx): ${status.dataDirectoryPath}/questions/\n` +
       `Pliki multimediów (.jpg, .wmv, .mp4): ${status.mediaDirectoryPath}/`;
 
-    // Sync job box
     const job = status.syncJob;
     if (job) {
       $('sync-stage-label').textContent = job.isRunning
@@ -256,7 +338,7 @@
 
   function ensureSyncPolling() {
     if (state.syncPollTimer) return;
-    state.syncPollTimer = window.setInterval(refreshStatus, 1200);
+    state.syncPollTimer = window.setInterval(refreshAdminStatus, 1200);
   }
 
   function stopSyncPolling() {
@@ -264,13 +346,6 @@
       window.clearInterval(state.syncPollTimer);
       state.syncPollTimer = null;
     }
-  }
-
-  function getAdminHeaders() {
-    const headers = { 'Content-Type': 'application/json' };
-    const tok = $('admin-token-input')?.value?.trim();
-    if (tok) headers['X-Admin-Token'] = tok;
-    return headers;
   }
 
   async function triggerGovSync(downloadMedia) {
@@ -284,7 +359,8 @@
     const convertWmv = Boolean($('sync-convert-wmv')?.checked);
     const resp = await fetch('/api/admin/sync', {
       method: 'POST',
-      headers: getAdminHeaders(),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         downloadQuestions: true,
         downloadMedia: downloadMedia,
@@ -292,25 +368,25 @@
       })
     });
 
-    if (resp.status === 401) {
-      window.alert('Wymagany prawidłowy token administratora (X-Admin-Token).');
+    if (resp.status === 401 || resp.status === 403) {
+      await loadAdminSessionAndPanel();
       return;
     }
 
-    await refreshStatus();
+    await refreshAdminStatus();
     ensureSyncPolling();
   }
 
   async function triggerLocalRescan() {
     const resp = await fetch('/api/admin/rescan', {
       method: 'POST',
-      headers: getAdminHeaders()
+      credentials: 'same-origin'
     });
-    if (resp.status === 401) {
-      window.alert('Wymagany prawidłowy token administratora (X-Admin-Token).');
+    if (resp.status === 401 || resp.status === 403) {
+      await loadAdminSessionAndPanel();
       return;
     }
-    await refreshStatus();
+    await refreshAdminStatus();
   }
 
   // =========================================================================
@@ -1206,7 +1282,6 @@
 
     $('btn-start-exam').addEventListener('click', startOfficialExam);
     $('btn-goto-study').addEventListener('click', () => switchView('study'));
-    $('btn-open-data-panel').addEventListener('click', () => switchView('data'));
 
     $('btn-next-question').addEventListener('click', handleNextQuestionClick);
     $('btn-finish-exam-early').addEventListener('click', async () => {
@@ -1272,14 +1347,28 @@
       }
     });
 
-    // Data sync buttons
+    // Admin login, logout, and data sync buttons (/admin)
+    $('admin-login-form').addEventListener('submit', handleAdminLogin);
+    $('btn-admin-logout').addEventListener('click', handleAdminLogout);
     $('btn-sync-questions').addEventListener('click', () => triggerGovSync(false));
     $('btn-sync-all-media').addEventListener('click', () => triggerGovSync(true));
     $('btn-rescan-local').addEventListener('click', triggerLocalRescan);
 
     window.addEventListener('keydown', handleExamKeydown);
+    window.addEventListener('popstate', () => {
+      if (window.location.pathname.startsWith('/admin')) {
+        switchView('admin', false);
+      } else if (state.currentView === 'admin') {
+        switchView('home', false);
+      }
+    });
 
-    refreshStatus();
+    if (window.location.pathname.startsWith('/admin') || window.location.hash === '#admin') {
+      refreshPublicStatus();
+      switchView('admin', false);
+    } else {
+      refreshPublicStatus();
+    }
   }
 
   if (document.readyState === 'loading') {

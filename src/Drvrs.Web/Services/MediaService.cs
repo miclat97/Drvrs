@@ -222,14 +222,23 @@ public sealed class MediaService
             if (!IsFfmpegAvailable)
             {
                 _logger.LogWarning("Plik {File} wymaga transkodowania WMV->MP4, ale narzędzie ffmpeg nie jest zainstalowane.", cleanName);
-                return new ResolvedMediaFile(sourcePath, "video/x-ms-wmv");
+                return EnsureInsideMediaRoot(sourcePath) ? new ResolvedMediaFile(sourcePath, "video/x-ms-wmv") : null;
             }
 
             var mp4Path = await EnsureMp4TranscodedAsync(sourcePath, stem, ct);
-            return new ResolvedMediaFile(mp4Path, "video/mp4");
+            return EnsureInsideMediaRoot(mp4Path) ? new ResolvedMediaFile(mp4Path, "video/mp4") : null;
         }
 
-        return new ResolvedMediaFile(sourcePath, GetContentType(actualExt));
+        return EnsureInsideMediaRoot(sourcePath)
+            ? new ResolvedMediaFile(sourcePath, GetContentType(actualExt))
+            : null;
+    }
+
+    private bool EnsureInsideMediaRoot(string candidatePath)
+    {
+        var root = Path.GetFullPath(_db.MediaDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var full = Path.GetFullPath(candidatePath);
+        return full.StartsWith(root, StringComparison.Ordinal);
     }
 
     public void PrewarmExamVideosInBackground(IEnumerable<string> mediaFileNames)

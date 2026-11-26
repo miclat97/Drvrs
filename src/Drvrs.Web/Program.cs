@@ -1,3 +1,4 @@
+using System.Threading.RateLimiting;
 using Drvrs.Web.Configuration;
 using Drvrs.Web.Data;
 using Drvrs.Web.Models;
@@ -14,11 +15,52 @@ builder.Services.AddSingleton<QuestionRepository>();
 builder.Services.AddSingleton<MediaService>();
 builder.Services.AddSingleton<ExamSessionService>();
 builder.Services.AddSingleton<GovDataSyncService>();
+builder.Services.AddSingleton<AdminAuthService>();
 
 builder.Services.AddHttpClient("GovPl", client =>
 {
     client.Timeout = TimeSpan.FromHours(6);
     client.DefaultRequestHeaders.UserAgent.ParseAdd("Drvrs-PrawoJazdy/1.0 (+https://gov.pl/web/infrastruktura/prawo-jazdy)");
+});
+
+// Cloudflare Tunnel / public internet rate limiting (keyed by CF-Connecting-IP when behind local tunnel)
+builder.Services.AddRateLimiter(limiter =>
+{
+    limiter.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    limiter.AddPolicy("AdminAuth", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: $"admin:{AdminAuthService.ResolveClientIpKey(httpContext)}",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 5,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+
+    limiter.AddPolicy("ExamStart", httpContext =>
+    {
+        var opts = httpContext.RequestServices.GetRequiredService<IOptions<DrvrsOptions>>().Value;
+        var limit = Math.Max(3, opts.ExamStartsPerMinutePerIp);
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: $"exam:{AdminAuthService.ResolveClientIpKey(httpContext)}",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = limit,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            });
+    });
+
+    limiter.AddPolicy("GeneralApi", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: $"api:{AdminAuthService.ResolveClientIpKey(httpContext)}",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 240,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
 });
 
 var app = builder.Build();
@@ -55,15 +97,39 @@ if (importIdx >= 0 && importIdx + 1 < args.Length)
 var govSync = app.Services.GetRequiredService<GovDataSyncService>();
 await govSync.InitializeLocalAndStartupDataAsync();
 
+// Security headers for public internet / Cloudflare Tunnel exposure
+app.Use(async (context, next) =>
+{
+    var headers = context.Response.Headers;
+    headers.XContentTypeOptions = "nosniff";
+    headers.XFrameOptions = "DENY";
+    headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+    headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()";
+    headers.ContentSecurityPolicy =
+        "default-src 'self'; " +
+        "script-src 'self'; " +
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+        "font-src 'self' https://fonts.gstatic.com; " +
+        "img-src 'self' data:; " +
+        "media-src 'self'; " +
+        "connect-src 'self'; " +
+        "frame-ancestors 'none'; " +
+        "base-uri 'self'; " +
+        "form-action 'self'";
+    await next();
+});
+
 app.UseDefaultFiles();
 app.UseStaticFiles();
+app.UseRateLimiter();
 
-var api = app.MapGroup("/api");
+var api = app.MapGroup("/api").RequireRateLimiting("GeneralApi");
 
-api.MapGet("/health", () => Results.Ok(new { status = "ok", runtime = Environment.Version.ToString() }));
+api.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
+// Public status endpoint — never exposes server filesystem paths or admin sync details
 api.MapGet("/status", async (GovDataSyncService sync, CancellationToken ct) =>
-    Results.Ok(await sync.GetDatabaseStatusAsync(ct)));
+    Results.Ok(await sync.GetPublicStatusAsync(ct)));
 
 api.MapPost("/exams", async (StartExamRequest? req, ExamSessionService exams, CancellationToken ct) =>
 {
@@ -76,7 +142,7 @@ api.MapPost("/exams", async (StartExamRequest? req, ExamSessionService exams, Ca
     {
         return Results.BadRequest(new { error = ex.Message });
     }
-});
+}).RequireRateLimiting("ExamStart");
 
 api.MapGet("/exams/{examId:guid}", (Guid examId, ExamSessionService exams) =>
 {
@@ -176,7 +242,7 @@ api.MapMethods("/media/{*fileName}", ["GET", "HEAD"], async (
     var resolved = await media.ResolveForBrowserAsync(fileName, ct);
     if (resolved is null)
     {
-        return Results.NotFound(new { error = $"Nie znaleziono pliku multimedialnego: {fileName}" });
+        return Results.NotFound(new { error = "Nie znaleziono pliku multimedialnego." });
     }
 
     httpContext.Response.Headers.CacheControl = "public, max-age=86400";
@@ -186,63 +252,97 @@ api.MapMethods("/media/{*fileName}", ["GET", "HEAD"], async (
         enableRangeProcessing: true);
 });
 
-api.MapPost("/admin/sync", (
-    StartSyncRequest? req,
-    HttpContext httpContext,
-    IOptions<DrvrsOptions> opts,
-    GovDataSyncService sync) =>
-{
-    if (!ValidateAdminAccess(httpContext, opts.Value, out var errorResult))
+// =============================================================================
+// Hardened Admin Endpoints (/api/admin/*) — Disabled unless AdminToken is set!
+// =============================================================================
+var adminApi = api.MapGroup("/admin");
+
+adminApi.MapGet("/session", (HttpContext ctx, AdminAuthService auth) =>
+    Results.Ok(new
     {
-        return errorResult!;
+        enabled = auth.IsAdminConfiguredAndEnabled,
+        authenticated = auth.IsRequestAuthorized(ctx)
+    }));
+
+adminApi.MapPost("/login", (AdminLoginRequest req, HttpContext ctx, AdminAuthService auth) =>
+{
+    if (!auth.IsAdminConfiguredAndEnabled)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
 
-    var started = sync.TryStartBackgroundSync(req ?? new StartSyncRequest());
-    return started
-        ? Results.Accepted("/api/status", sync.CurrentStatus)
-        : Results.Conflict(new { error = "Synchronizacja jest już w toku.", status = sync.CurrentStatus });
+    if (!auth.VerifyPasswordConstantTime(req.Password))
+    {
+        return Results.Unauthorized();
+    }
+
+    auth.IssueAdminCookie(ctx);
+    return Results.Ok(new { authenticated = true });
+}).RequireRateLimiting("AdminAuth");
+
+adminApi.MapPost("/logout", (HttpContext ctx, AdminAuthService auth) =>
+{
+    auth.ClearAdminCookie(ctx);
+    return Results.Ok(new { authenticated = false });
 });
 
-api.MapPost("/admin/rescan", async (
-    HttpContext httpContext,
-    IOptions<DrvrsOptions> opts,
+adminApi.MapGet("/status", async (
+    HttpContext ctx,
+    AdminAuthService auth,
     GovDataSyncService sync,
     CancellationToken ct) =>
 {
-    if (!ValidateAdminAccess(httpContext, opts.Value, out var errorResult))
-    {
-        return errorResult!;
-    }
-
-    var importRes = await sync.RescanLocalFilesAsync(forceExcelReimport: true, ct);
-    var status = await sync.GetDatabaseStatusAsync(ct);
-    return Results.Ok(new { imported = importRes, status });
+    if (!EnsureAdminAuthorized(ctx, auth, out var denied)) return denied!;
+    return Results.Ok(await sync.GetAdminStatusAsync(ct));
 });
 
-// Fallback SPA route to index.html for non-API paths
+adminApi.MapPost("/sync", (
+    StartSyncRequest? req,
+    HttpContext ctx,
+    AdminAuthService auth,
+    GovDataSyncService sync) =>
+{
+    if (!EnsureAdminAuthorized(ctx, auth, out var denied)) return denied!;
+
+    var started = sync.TryStartBackgroundSync(req ?? new StartSyncRequest());
+    return started
+        ? Results.Accepted("/api/admin/status", sync.CurrentStatus)
+        : Results.Conflict(new { error = "Synchronizacja jest już w toku.", status = sync.CurrentStatus });
+}).RequireRateLimiting("AdminAuth");
+
+adminApi.MapPost("/rescan", async (
+    HttpContext ctx,
+    AdminAuthService auth,
+    GovDataSyncService sync,
+    CancellationToken ct) =>
+{
+    if (!EnsureAdminAuthorized(ctx, auth, out var denied)) return denied!;
+
+    var importRes = await sync.RescanLocalFilesAsync(forceExcelReimport: true, ct);
+    var status = await sync.GetAdminStatusAsync(ct);
+    return Results.Ok(new { imported = importRes, status });
+}).RequireRateLimiting("AdminAuth");
+
+// Fallback SPA route (including /admin) to index.html
 app.MapFallbackToFile("index.html");
 
 app.Run();
 
-static bool ValidateAdminAccess(HttpContext ctx, DrvrsOptions options, out IResult? errorResult)
+static bool EnsureAdminAuthorized(HttpContext ctx, AdminAuthService auth, out IResult? denied)
 {
-    if (!options.EnableAdminEndpoints)
+    if (!auth.IsAdminConfiguredAndEnabled)
     {
-        errorResult = Results.StatusCode(StatusCodes.Status403Forbidden);
+        denied = Results.StatusCode(StatusCodes.Status403Forbidden);
         return false;
     }
 
-    if (!string.IsNullOrWhiteSpace(options.AdminToken))
+    if (!auth.IsRequestAuthorized(ctx))
     {
-        var provided = ctx.Request.Headers["X-Admin-Token"].FirstOrDefault();
-        if (!string.Equals(provided, options.AdminToken, StringComparison.Ordinal))
-        {
-            errorResult = Results.Unauthorized();
-            return false;
-        }
+        denied = Results.Unauthorized();
+        return false;
     }
 
-    errorResult = null;
+    denied = null;
     return true;
 }
 

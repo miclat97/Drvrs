@@ -37,13 +37,11 @@ public sealed class DrvrsOptions
 
     /// <summary>
     /// Automatically download, unpack, and clean up the official multimedia ZIP archives on startup if media folder is empty.
-    /// Ideal for turnkey Docker deployments.
     /// </summary>
     public bool AutoSyncMediaOnStartup { get; set; } = false;
 
     /// <summary>
-    /// When true, .wmv files extracted during ZIP sync are immediately transcoded to H.264 .mp4 and the source .wmv is deleted,
-    /// reducing total disk usage from ~9.5 GB to ~2.5 GB.
+    /// When true, .wmv files extracted during ZIP sync are immediately transcoded to H.264 .mp4 and the source .wmv is deleted.
     /// </summary>
     public bool ConvertWmvDuringSync { get; set; } = false;
 
@@ -63,15 +61,26 @@ public sealed class DrvrsOptions
     public string FfmpegExecutable { get; set; } = "ffmpeg";
 
     /// <summary>
-    /// Enables /api/admin/* endpoints in the web UI for triggering gov.pl downloads or Excel re-imports.
+    /// Master switch for /api/admin/* endpoints. Even when true, AdminToken MUST ALSO be non-empty for admin login to work!
+    /// Safe by default when exposed to the public internet (e.g. Cloudflare Tunnel).
     /// </summary>
     public bool EnableAdminEndpoints { get; set; } = true;
 
     /// <summary>
-    /// Optional secret token required via X-Admin-Token header when triggering sync operations on a public server.
-    /// Leave empty for open local/self-hosted management.
+    /// Secret admin password/token required to log in at /admin or call /api/admin/*.
+    /// IMPORTANT: When empty (default), the web admin panel is completely locked/disabled!
     /// </summary>
     public string? AdminToken { get; set; }
+
+    /// <summary>
+    /// Maximum concurrent exam sessions kept in RAM to protect against memory exhaustion on public servers.
+    /// </summary>
+    public int MaxActiveExamSessions { get; set; } = 2000;
+
+    /// <summary>
+    /// Maximum new exams a single client IP can start per minute.
+    /// </summary>
+    public int ExamStartsPerMinutePerIp { get; set; } = 15;
 
     public string ResolveDataDirectory(string contentRootPath)
     {
