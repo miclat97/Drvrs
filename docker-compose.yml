@@ -6,7 +6,7 @@ services:
     container_name: drvrs-prawo-jazdy
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080"
+      - "8080:8080"
     environment:
       # Automatyczne pobranie pytań (.xlsx -> SQLite) przy pierwszym starcie, gdy wolumen jest pusty:
       Drvrs__AutoSyncQuestionsOnStartup: "true"

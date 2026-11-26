@@ -28,7 +28,7 @@ COPY --from=build --chown=app:app /app/publish ./
 
 USER app
 
-ENV ASPNETCORE_URLS="http://+:8080" \
+ENV ASPNETCORE_HTTP_PORTS="8080" \
     DOTNET_RUNNING_IN_CONTAINER="true" \
     Drvrs__DataDirectory="/app/data" \
     Drvrs__AutoSyncQuestionsOnStartup="true" \

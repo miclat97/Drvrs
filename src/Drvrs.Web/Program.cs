@@ -107,12 +107,12 @@ app.Use(async (context, next) =>
     headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()";
     headers.ContentSecurityPolicy =
         "default-src 'self'; " +
-        "script-src 'self'; " +
+        "script-src 'self' https://static.cloudflareinsights.com https://ajax.cloudflare.com; " +
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
         "font-src 'self' https://fonts.gstatic.com; " +
         "img-src 'self' data:; " +
         "media-src 'self'; " +
-        "connect-src 'self'; " +
+        "connect-src 'self' https://cloudflareinsights.com; " +
         "frame-ancestors 'none'; " +
         "base-uri 'self'; " +
         "form-action 'self'";
